@@ -1,0 +1,15 @@
+{
+    "video_path": "calibration_video.mp4",
+    "board_width": 9,
+    "board_height": 6,
+    "square_size": 0.025,
+    "output_file": "calibration_results.yaml",
+    "undistorted_image_output": "undistorted_sample.jpg",
+    "output_model": "DS",
+    "show_detection": true,
+    "frame_step": 10,
+
+    "max_frames": 80,
+    "outlier_reject_threshold_px": 10.0,
+    "outlier_reject_top_fraction": 0.2
+}
