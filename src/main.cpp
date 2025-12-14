@@ -8,6 +8,7 @@
 #include <cmath>
 #include <numeric>
 #include <algorithm>
+#include <iomanip>
 
 using json = nlohmann::json;
 using namespace std;
@@ -26,6 +27,11 @@ struct Config {
     int max_frames;
     double outlier_reject_threshold_px;
     double outlier_reject_top_fraction;
+    // Intelligent frame selection
+    bool smart_frame_selection;
+    int grid_divisions;        // Divide image into NxN grid for FOV coverage
+    int min_frames_per_cell;   // Minimum frames per grid cell
+    double min_orientation_diff; // Minimum orientation difference (degrees)
 };
 
 Config loadConfig(const string& filename) {
@@ -47,8 +53,119 @@ Config loadConfig(const string& filename) {
     cfg.max_frames = data.value("max_frames", 80);
     cfg.outlier_reject_threshold_px = data.value("outlier_reject_threshold_px", -1.0);
     cfg.outlier_reject_top_fraction = data.value("outlier_reject_top_fraction", 0.2);
+    // Intelligent frame selection parameters
+    cfg.smart_frame_selection = data.value("smart_frame_selection", false);
+    cfg.grid_divisions = data.value("grid_divisions", 5);  // 5x5 grid = 25 cells
+    cfg.min_frames_per_cell = data.value("min_frames_per_cell", 2);
+    cfg.min_orientation_diff = data.value("min_orientation_diff", 15.0);  // degrees
     return cfg;
 }
+
+// ============ Intelligent Frame Selection Helpers ============
+
+// Compute the centroid of detected corners
+static Point2f computeCentroid(const vector<Point2f>& corners) {
+    Point2f centroid(0, 0);
+    for (const auto& c : corners) {
+        centroid.x += c.x;
+        centroid.y += c.y;
+    }
+    centroid.x /= corners.size();
+    centroid.y /= corners.size();
+    return centroid;
+}
+
+// Compute board orientation from corners (angle of first row)
+static double computeBoardOrientation(const vector<Point2f>& corners, int boardWidth) {
+    // Use first and last corner of first row to compute orientation
+    Point2f p1 = corners[0];
+    Point2f p2 = corners[boardWidth - 1];
+    double dx = p2.x - p1.x;
+    double dy = p2.y - p1.y;
+    return atan2(dy, dx) * 180.0 / CV_PI;  // degrees
+}
+
+// Compute board size (diagonal span) to estimate distance
+static double computeBoardSize(const vector<Point2f>& corners) {
+    Point2f minPt = corners[0], maxPt = corners[0];
+    for (const auto& c : corners) {
+        minPt.x = min(minPt.x, c.x);
+        minPt.y = min(minPt.y, c.y);
+        maxPt.x = max(maxPt.x, c.x);
+        maxPt.y = max(maxPt.y, c.y);
+    }
+    return sqrt((maxPt.x - minPt.x) * (maxPt.x - minPt.x) + 
+                (maxPt.y - minPt.y) * (maxPt.y - minPt.y));
+}
+
+// Compute tilt angles from corner pattern (perspective distortion)
+static pair<double, double> computeBoardTilt(const vector<Point2f>& corners, int boardWidth, int boardHeight) {
+    // Horizontal tilt: compare top and bottom row lengths
+    double topRowLen = norm(corners[boardWidth - 1] - corners[0]);
+    double botRowLen = norm(corners[(boardHeight - 1) * boardWidth + boardWidth - 1] - 
+                           corners[(boardHeight - 1) * boardWidth]);
+    double hTilt = (topRowLen - botRowLen) / max(topRowLen, botRowLen) * 45.0;  // rough angle estimate
+    
+    // Vertical tilt: compare left and right column lengths
+    double leftColLen = norm(corners[(boardHeight - 1) * boardWidth] - corners[0]);
+    double rightColLen = norm(corners[(boardHeight - 1) * boardWidth + boardWidth - 1] - 
+                             corners[boardWidth - 1]);
+    double vTilt = (leftColLen - rightColLen) / max(leftColLen, rightColLen) * 45.0;
+    
+    return {hTilt, vTilt};
+}
+
+// Get grid cell index for a point
+static int getGridCell(const Point2f& pt, const Size& imageSize, int gridDivisions) {
+    int cellX = min(gridDivisions - 1, max(0, (int)(pt.x / imageSize.width * gridDivisions)));
+    int cellY = min(gridDivisions - 1, max(0, (int)(pt.y / imageSize.height * gridDivisions)));
+    return cellY * gridDivisions + cellX;
+}
+
+// Structure to hold frame info for smart selection
+struct FrameInfo {
+    int frameIdx;
+    vector<Point2f> corners;
+    Point2f centroid;
+    double orientation;
+    double boardSize;
+    pair<double, double> tilt;
+    int gridCell;
+};
+
+// Check if new frame is sufficiently different from existing frames
+static bool isFrameDiverse(const FrameInfo& newFrame, 
+                          const vector<FrameInfo>& existingFrames,
+                          double minOrientationDiff,
+                          int gridDivisions) {
+    // Count frames in same grid cell
+    int sameCellCount = 0;
+    for (const auto& f : existingFrames) {
+        if (f.gridCell == newFrame.gridCell) {
+            sameCellCount++;
+            
+            // Check orientation difference
+            double orientDiff = abs(f.orientation - newFrame.orientation);
+            if (orientDiff > 180) orientDiff = 360 - orientDiff;
+            
+            // Check tilt difference
+            double tiltDiff = abs(f.tilt.first - newFrame.tilt.first) + 
+                             abs(f.tilt.second - newFrame.tilt.second);
+            
+            // Check size difference (distance proxy)
+            double sizeDiff = abs(f.boardSize - newFrame.boardSize) / max(f.boardSize, newFrame.boardSize) * 100;
+            
+            // If very similar frame exists in same cell, reject
+            if (orientDiff < minOrientationDiff && tiltDiff < 10 && sizeDiff < 20) {
+                return false;
+            }
+        }
+    }
+    
+    return true;
+}
+
+// ============ End of Intelligent Frame Selection Helpers ============
 
 static double computeViewRms(const vector<Point3f>& obj,
                              const vector<Point2f>& img,
@@ -128,8 +245,20 @@ int main(int argc, char** argv) {
     int frameCount = 0;
     Size imageSize;
     int validFrames = 0;
+    int skippedSimilar = 0;
+
+    // For intelligent frame selection
+    vector<FrameInfo> selectedFrames;
+    vector<int> gridCellCounts;
+    if (cfg.smart_frame_selection) {
+        gridCellCounts.resize(cfg.grid_divisions * cfg.grid_divisions, 0);
+    }
 
     cout << "Processing video..." << endl;
+    if (cfg.smart_frame_selection) {
+        cout << "Smart frame selection ENABLED (grid: " << cfg.grid_divisions << "x" << cfg.grid_divisions 
+             << ", min orientation diff: " << cfg.min_orientation_diff << " deg)" << endl;
+    }
 
     while (true) {
         cap >> frame;
@@ -149,13 +278,39 @@ int main(int argc, char** argv) {
                 cornerSubPix(gray, corners, Size(11, 11), Size(-1, -1),
                     TermCriteria(TermCriteria::EPS + TermCriteria::COUNT, 30, 0.01));
                 
-                imagePoints.push_back(corners);
-                objectPoints.push_back(obj);
-                validFrames++;
+                bool acceptFrame = true;
+                
+                if (cfg.smart_frame_selection) {
+                    // Compute frame characteristics
+                    FrameInfo fi;
+                    fi.frameIdx = frameCount;
+                    fi.corners = corners;
+                    fi.centroid = computeCentroid(corners);
+                    fi.orientation = computeBoardOrientation(corners, cfg.board_width);
+                    fi.boardSize = computeBoardSize(corners);
+                    fi.tilt = computeBoardTilt(corners, cfg.board_width, cfg.board_height);
+                    fi.gridCell = getGridCell(fi.centroid, imageSize, cfg.grid_divisions);
+                    
+                    // Check if frame is sufficiently different
+                    acceptFrame = isFrameDiverse(fi, selectedFrames, cfg.min_orientation_diff, cfg.grid_divisions);
+                    
+                    if (acceptFrame) {
+                        selectedFrames.push_back(fi);
+                        gridCellCounts[fi.gridCell]++;
+                    } else {
+                        skippedSimilar++;
+                    }
+                }
+                
+                if (acceptFrame) {
+                    imagePoints.push_back(corners);
+                    objectPoints.push_back(obj);
+                    validFrames++;
 
-                if (cfg.max_frames > 0 && validFrames >= cfg.max_frames) {
-                    cout << "Reached max_frames=" << cfg.max_frames << ", stopping capture." << endl;
-                    break;
+                    if (cfg.max_frames > 0 && validFrames >= cfg.max_frames) {
+                        cout << "\nReached max_frames=" << cfg.max_frames << ", stopping capture." << endl;
+                        break;
+                    }
                 }
                 
                 if (cfg.show_detection) {
@@ -164,17 +319,53 @@ int main(int argc, char** argv) {
                     
                     // Add text showing frame info
                     string text = "Frame: " + to_string(frameCount) + " | Valid: " + to_string(validFrames);
+                    if (cfg.smart_frame_selection) {
+                        text += " | Skipped: " + to_string(skippedSimilar);
+                        if (!acceptFrame) {
+                            putText(displayFrame, "SKIPPED (similar)", Point(10, 60), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 0, 255), 2);
+                        }
+                    }
                     putText(displayFrame, text, Point(10, 30), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 255, 0), 2);
                     
                     imshow("Detection", displayFrame);
                     waitKey(1);
                 }
-                cout << "Found corners in frame " << frameCount << ". Total valid frames: " << validFrames << "\r" << flush;
+                cout << "Frame " << frameCount << " | Valid: " << validFrames;
+                if (cfg.smart_frame_selection) {
+                    cout << " | Skipped similar: " << skippedSimilar;
+                }
+                cout << "\r" << flush;
             }
         }
         frameCount++;
     }
     cout << endl;
+    
+    // Print FOV coverage statistics if smart selection was used
+    if (cfg.smart_frame_selection && !gridCellCounts.empty()) {
+        cout << "\n=== FOV Coverage Analysis ===" << endl;
+        int totalCells = cfg.grid_divisions * cfg.grid_divisions;
+        int coveredCells = 0;
+        int wellCoveredCells = 0;
+        
+        cout << "Grid coverage (frames per cell):" << endl;
+        for (int y = 0; y < cfg.grid_divisions; y++) {
+            cout << "  ";
+            for (int x = 0; x < cfg.grid_divisions; x++) {
+                int count = gridCellCounts[y * cfg.grid_divisions + x];
+                cout << setw(3) << count << " ";
+                if (count > 0) coveredCells++;
+                if (count >= cfg.min_frames_per_cell) wellCoveredCells++;
+            }
+            cout << endl;
+        }
+        cout << "Cells with data: " << coveredCells << "/" << totalCells 
+             << " (" << (100.0 * coveredCells / totalCells) << "%)" << endl;
+        cout << "Well-covered cells (>=" << cfg.min_frames_per_cell << " frames): " << wellCoveredCells << "/" << totalCells 
+             << " (" << (100.0 * wellCoveredCells / totalCells) << "%)" << endl;
+        cout << "Total frames skipped (too similar): " << skippedSimilar << endl;
+        cout << "============================\n" << endl;
+    }
     
     if (validFrames < 1) {
         cerr << "No valid frames found for calibration." << endl;
@@ -191,6 +382,7 @@ int main(int argc, char** argv) {
     Mat D_init = Mat::zeros(4, 1, CV_64F);
 
     CalibResult calib1 = runFisheyeCalib(objectPoints, imagePoints, imageSize, K_init, D_init);
+
 
     cout << "Stage-1 RMS (OpenCV): " << calib1.rms << " pixels" << endl;
     cout << "Stage-1 K:" << endl << calib1.K << endl;
