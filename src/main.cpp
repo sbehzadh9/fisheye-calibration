@@ -322,64 +322,150 @@ int main(int argc, char** argv) {
         cout << "KB8 Coefficients (k1-k8): " << kb8_coeffs.t() << endl;
 
     } else if (cfg.output_model == "OCam") {
-        cout << "Fitting OCam model..." << endl;
-        // OCam (Scaramuzza): Projects world point to image using polynomial
-        // Forward model: rho = invpol(theta) where invpol is a polynomial
-        // Inverse model: theta = pol(rho) - used for unprojection
-        // We fit the inverse polynomial: theta = a0 + a1*rho + a2*rho^2 + ... + aN*rho^N
+        cout << "Fitting OCam model (Scaramuzza format)..." << endl;
+        // OCam (Scaramuzza) model - standard format used by camera suppliers
+        // 
+        // Unprojection (image -> 3D ray):
+        //   Given pixel (u, v), compute 3D direction
+        //   x' = c*(u - cx) + d*(v - cy)
+        //   y' = e*(u - cx) + (v - cy)
+        //   rho = sqrt(x'^2 + y'^2)
+        //   z = pol(rho) = a0 + a1*rho + a2*rho^2 + a3*rho^3 + a4*rho^4
+        //   3D ray direction: (x', y', z) normalized
+        //
+        // Projection (3D -> image):
+        //   Given 3D point (X, Y, Z), compute theta = atan2(sqrt(X^2+Y^2), Z)
+        //   rho = invpol(theta) = b0 + b1*theta + b2*theta^2 + ... 
+        //   Then project to image using affine params
+        //
+        // Key insight: pol(rho) gives the z-coordinate, and for equidistant projection
+        // at rho=0, z should be pointing forward, so pol(0) = a0 ≈ -focal_length
         
         double fx = K.at<double>(0, 0);
         double fy = K.at<double>(1, 1);
-        double f_avg = (fx + fy) / 2.0;
+        double cx = K.at<double>(0, 2);
+        double cy = K.at<double>(1, 2);
         
-        vector<double> rho_data, theta_data_ocam;
-        double max_theta = CV_PI / 2.0 * 0.95; // Avoid singularity
+        // For 200° FOV, max_theta ~ 100° = 1.745 rad
+        double max_theta = CV_PI * 100.0 / 180.0;
         int num_samples = 1000;
         
-        for (int i = 0; i < num_samples; ++i) {
-            double th = max_theta * (i + 1) / num_samples;
-            double th2 = th * th;
+        vector<double> rho_samples, theta_samples;
+        
+        // Generate (rho, theta) pairs from KB4 model
+        for (int i = 1; i <= num_samples; ++i) {
+            double theta = max_theta * i / num_samples;
+            double th2 = theta * theta;
             double th4 = th2 * th2;
             double th6 = th4 * th2;
             double th8 = th4 * th4;
             
-            // OpenCV KB4 model
-            double scale = 1.0 + D.at<double>(0) * th2 + D.at<double>(1) * th4 + 
-                           D.at<double>(2) * th6 + D.at<double>(3) * th8;
-            double th_d = th * scale;
-            double rho = f_avg * th_d; // Distorted radius in pixels
+            // KB4 model: theta_d = theta * (1 + k1*th^2 + k2*th^4 + k3*th^6 + k4*th^8)
+            double theta_d = theta * (1.0 + D.at<double>(0)*th2 + D.at<double>(1)*th4 + 
+                                      D.at<double>(2)*th6 + D.at<double>(3)*th8);
+            double rho = fx * theta_d;  // radius in pixels
             
-            rho_data.push_back(rho);
-            theta_data_ocam.push_back(th); // Original angle
+            rho_samples.push_back(rho);
+            theta_samples.push_back(theta);
         }
         
-        // Fit polynomial: theta = a0 + a1*rho + a2*rho^2 + ... + a5*rho^5
-        int poly_order = 5;
-        Mat A(num_samples, poly_order + 1, CV_64F);
-        Mat b(num_samples, 1, CV_64F);
+        // ============ Forward polynomial (pol): z = f(rho) ============
+        // OCam convention: z = pol(rho) where the 3D point is (x', y', z)
+        // For a unit vector at angle theta from optical axis:
+        //   x' = rho (the image distance from center)
+        //   z = rho / tan(theta)  for perspective, but for fisheye it's different
+        // 
+        // The relationship is: if we have image point at distance rho from center,
+        // the 3D ray has z = rho / tan(theta) where theta is the angle from optical axis
+        // But we need to express z as polynomial in rho
+        //
+        // From rho and theta, the z-component scaled to match x'=rho:
+        // z = rho * cos(theta) / sin(theta) = rho * cot(theta)
+        // But for OCam, the convention is often z = -f + higher order terms
+        
+        int pol_order = 4;  // 5 coefficients (a0 to a4)
+        Mat A_pol(num_samples, pol_order + 1, CV_64F);
+        Mat b_pol(num_samples, 1, CV_64F);
         
         for (int i = 0; i < num_samples; ++i) {
-            double rho = rho_data[i];
-            double theta = theta_data_ocam[i];
+            double rho = rho_samples[i];
+            double theta = theta_samples[i];
+            
+            // z such that (rho, z) gives direction at angle theta
+            // tan(theta) = rho / (-z)  =>  z = -rho / tan(theta)
+            double z = -rho / tan(theta);
             
             double rho_pow = 1.0;
-            for (int j = 0; j <= poly_order; ++j) {
-                A.at<double>(i, j) = rho_pow;
+            for (int j = 0; j <= pol_order; ++j) {
+                A_pol.at<double>(i, j) = rho_pow;
                 rho_pow *= rho;
             }
-            b.at<double>(i, 0) = theta;
+            b_pol.at<double>(i, 0) = z;
         }
         
-        Mat coeffs;
-        solve(A, b, coeffs, DECOMP_SVD);
+        Mat pol_coeffs;
+        solve(A_pol, b_pol, pol_coeffs, DECOMP_SVD);
         
-        fs << "DistortionCoeffs_OCam" << coeffs;
-        fs << "CenterX" << K.at<double>(0, 2);
-        fs << "CenterY" << K.at<double>(1, 2);
-        fs << "AffineC" << 1.0;  // c parameter (typically 1.0)
-        fs << "AffineD" << 0.0;  // d parameter (typically 0.0)
-        fs << "AffineE" << 1.0;  // e parameter (typically 1.0)
-        cout << "OCam Polynomial Coefficients (a0-a5): " << coeffs.t() << endl;
+        // ============ Inverse polynomial (invpol): rho = g(theta) ============
+        // invpol maps theta (angle from optical axis) to rho (image distance)
+        // This is essentially the KB4 projection stored as polynomial
+        
+        int invpol_order = 12;  // 13 coefficients
+        Mat A_invpol(num_samples, invpol_order + 1, CV_64F);
+        Mat b_invpol(num_samples, 1, CV_64F);
+        
+        for (int i = 0; i < num_samples; ++i) {
+            double theta = theta_samples[i];
+            double rho = rho_samples[i];
+            
+            double theta_pow = 1.0;
+            for (int j = 0; j <= invpol_order; ++j) {
+                A_invpol.at<double>(i, j) = theta_pow;
+                theta_pow *= theta;
+            }
+            b_invpol.at<double>(i, 0) = rho;
+        }
+        
+        Mat invpol_coeffs;
+        solve(A_invpol, b_invpol, invpol_coeffs, DECOMP_SVD);
+        
+        // Affine parameters (for non-square pixels or sensor misalignment)
+        // ac (c): ~1.0 (aspect ratio), ad (d): ~0 (skew), ae (e): ~0 (skew)
+        double ac = fy / fx;  // aspect ratio correction
+        double ad = 0.0;      // skew parameter d
+        double ae = 0.0;      // skew parameter e
+        
+        // Write OCam format matching supplier's YAML structure
+        fs << "model_type" << "Ocam";
+        fs << "camera_name" << "calibrated";
+        fs << "image_width" << imageSize.width;
+        fs << "image_height" << imageSize.height;
+        
+        // Forward polynomial (for unprojection)
+        fs << "length_pol" << (pol_order + 1);
+        // Transpose to row vector (1 x N) to match supplier format
+        fs << "pol_data" << pol_coeffs.t();
+        
+        // Inverse polynomial (for projection)
+        fs << "length_invpol" << (invpol_order + 1);
+        // Transpose to row vector (1 x N) to match supplier format
+        fs << "invpol_data" << invpol_coeffs.t();
+        
+        // Affine transformation parameters
+        fs << "ac" << ac;
+        fs << "ad" << ad;
+        fs << "ae" << ae;
+        
+        // Principal point
+        fs << "center_x" << cx;
+        fs << "center_y" << cy;
+        
+        cout << "OCam Model Parameters:" << endl;
+        cout << "  Image size: " << imageSize.width << "x" << imageSize.height << endl;
+        cout << "  Center: (" << cx << ", " << cy << ")" << endl;
+        cout << "  Affine: ac=" << ac << ", ad=" << ad << ", ae=" << ae << endl;
+        cout << "  Forward pol (length=" << (pol_order+1) << "): " << pol_coeffs.t() << endl;
+        cout << "  Inverse invpol (length=" << (invpol_order+1) << "): " << invpol_coeffs.t() << endl;
         
     } else if (cfg.output_model == "DS" || cfg.output_model == "DoubleSphere") {
         cout << "Fitting Double Sphere model (best for >180° FOV)..." << endl;
