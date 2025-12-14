@@ -3,9 +3,11 @@
 #include <nlohmann/json.hpp>
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <vector>
 #include <string>
 #include <cmath>
+#include <ctime>
 #include <numeric>
 #include <algorithm>
 #include <iomanip>
@@ -32,6 +34,51 @@ struct Config {
     int grid_divisions;        // Divide image into NxN grid for FOV coverage
     int min_frames_per_cell;   // Minimum frames per grid cell
     double min_orientation_diff; // Minimum orientation difference (degrees)
+    // Report output
+    string report_file;
+};
+
+// Structure to hold calibration report data
+struct CalibrationReport {
+    // Frame statistics
+    int total_frames_processed = 0;
+    int total_frames_detected = 0;
+    int frames_kept = 0;
+    int frames_skipped_similar = 0;
+    
+    // Smart selection settings
+    bool smart_selection_enabled = false;
+    int grid_divisions = 5;
+    double min_orientation_diff = 15.0;
+    
+    // FOV coverage
+    vector<int> grid_cell_counts;
+    int total_cells = 0;
+    int covered_cells = 0;
+    int well_covered_cells = 0;
+    double coverage_percentage = 0.0;
+    double well_covered_percentage = 0.0;
+    
+    // Calibration results
+    double stage1_rms = 0.0;
+    double stage2_rms = 0.0;
+    int stage1_views = 0;
+    int stage2_views = 0;
+    double min_view_rms = 0.0;
+    double max_view_rms = 0.0;
+    double avg_view_rms = 0.0;
+    int views_below_1px = 0;
+    int views_1_5px = 0;
+    int views_5_10px = 0;
+    int views_above_10px = 0;
+    
+    // Camera parameters
+    double fx = 0.0, fy = 0.0, cx = 0.0, cy = 0.0;
+    Size image_size;
+    string model_type;
+    
+    // Timing
+    string timestamp;
 };
 
 Config loadConfig(const string& filename) {
@@ -58,6 +105,8 @@ Config loadConfig(const string& filename) {
     cfg.grid_divisions = data.value("grid_divisions", 5);  // 5x5 grid = 25 cells
     cfg.min_frames_per_cell = data.value("min_frames_per_cell", 2);
     cfg.min_orientation_diff = data.value("min_orientation_diff", 15.0);  // degrees
+    // Report output file
+    cfg.report_file = data.value("report_file", "calibration_report.txt");
     return cfg;
 }
 
@@ -165,6 +214,218 @@ static bool isFrameDiverse(const FrameInfo& newFrame,
     return true;
 }
 
+// ============ Report Generation Functions ============
+
+static string getCurrentTimestamp() {
+    time_t now = time(nullptr);
+    char buf[80];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    return string(buf);
+}
+
+static void generateReport(const CalibrationReport& report, const string& reportPath, const Config& cfg) {
+    // Create report content
+    stringstream ss;
+    
+    ss << "================================================================================\n";
+    ss << "                    FISHEYE CAMERA CALIBRATION REPORT\n";
+    ss << "================================================================================\n";
+    ss << "Generated: " << report.timestamp << "\n";
+    ss << "Video: " << cfg.video_path << "\n";
+    ss << "Output Model: " << report.model_type << "\n";
+    ss << "\n";
+    
+    // Frame Selection Summary
+    ss << "--------------------------------------------------------------------------------\n";
+    ss << "                         FRAME SELECTION SUMMARY\n";
+    ss << "--------------------------------------------------------------------------------\n";
+    ss << "\n";
+    ss << "| Metric                    | Value                                    |\n";
+    ss << "|---------------------------|------------------------------------------|\n";
+    ss << "| Smart Frame Selection     | " << (report.smart_selection_enabled ? "ENABLED" : "DISABLED") << setw(33 - (report.smart_selection_enabled ? 7 : 8)) << " |\n";
+    ss << "| Total frames processed    | " << setw(40) << left << report.total_frames_processed << " |\n";
+    ss << "| Frames with board detected| " << setw(40) << left << report.total_frames_detected << " |\n";
+    
+    if (report.smart_selection_enabled) {
+        stringstream fs;
+        fs << report.frames_kept << " kept, " << report.frames_skipped_similar << " skipped";
+        ss << "| Frames after filtering    | " << setw(40) << left << fs.str() << " |\n";
+        ss << "| Similar frames skipped    | " << setw(40) << left << report.frames_skipped_similar << " |\n";
+    } else {
+        ss << "| Frames used               | " << setw(40) << left << report.frames_kept << " |\n";
+    }
+    ss << "\n";
+    
+    // FOV Coverage Analysis
+    if (report.smart_selection_enabled && !report.grid_cell_counts.empty()) {
+        ss << "--------------------------------------------------------------------------------\n";
+        ss << "                          FOV COVERAGE ANALYSIS\n";
+        ss << "--------------------------------------------------------------------------------\n";
+        ss << "\n";
+        
+        ss << "Grid: " << report.grid_divisions << "x" << report.grid_divisions << " (" << report.total_cells << " cells)\n";
+        ss << "Min orientation difference: " << report.min_orientation_diff << " degrees\n\n";
+        
+        // Coverage metrics
+        stringstream cov1, cov2;
+        cov1 << report.covered_cells << "/" << report.total_cells << " (" << fixed << setprecision(0) << report.coverage_percentage << "%)";
+        cov2 << report.well_covered_cells << "/" << report.total_cells << " (" << fixed << setprecision(0) << report.well_covered_percentage << "%)";
+        
+        ss << "| Metric                    | Value                                    |\n";
+        ss << "|---------------------------|------------------------------------------|\n";
+        ss << "| FOV coverage (any frames) | " << setw(40) << left << cov1.str() << " |\n";
+        ss << "| Well-covered cells (>=2)  | " << setw(40) << left << cov2.str() << " |\n";
+        ss << "\n";
+        
+        // Grid visualization
+        ss << "FOV Coverage Grid (frames per cell):\n\n";
+        int g = report.grid_divisions;
+        
+        // Top border
+        ss << "    +";
+        for (int x = 0; x < g; x++) ss << "-----+";
+        ss << "\n";
+        
+        // Row labels
+        ss << "    |";
+        for (int x = 0; x < g; x++) {
+            string label;
+            if (x == 0) label = " L ";
+            else if (x == g-1) label = " R ";
+            else if (x == g/2) label = " C ";
+            else label = "   ";
+            ss << " " << label << " |";
+        }
+        ss << "   (L=Left, C=Center, R=Right)\n";
+        
+        ss << "    +";
+        for (int x = 0; x < g; x++) ss << "-----+";
+        ss << "\n";
+        
+        for (int y = 0; y < g; y++) {
+            string rowLabel;
+            if (y == 0) rowLabel = " T ";
+            else if (y == g-1) rowLabel = " B ";
+            else if (y == g/2) rowLabel = " M ";
+            else rowLabel = "   ";
+            
+            ss << rowLabel << " |";
+            for (int x = 0; x < g; x++) {
+                int count = report.grid_cell_counts[y * g + x];
+                ss << " " << setw(3) << count << " |";
+            }
+            
+            if (y == 0) ss << "   T=Top";
+            else if (y == g/2) ss << "   M=Middle";
+            else if (y == g-1) ss << "   B=Bottom";
+            ss << "\n";
+            
+            ss << "    +";
+            for (int x = 0; x < g; x++) ss << "-----+";
+            ss << "\n";
+        }
+        ss << "\n";
+        
+        // Coverage advice
+        if (report.coverage_percentage < 50) {
+            ss << "⚠️  WARNING: Low FOV coverage! For best calibration of wide-angle lenses:\n";
+            ss << "    - Move the checkerboard to the edges and corners of the image\n";
+            ss << "    - Include more poses at different distances and tilts\n";
+            ss << "    - Aim for at least 60% grid coverage\n\n";
+        } else if (report.coverage_percentage < 75) {
+            ss << "💡 TIP: Coverage is moderate. For a 200° FOV lens, try to get more frames\n";
+            ss << "    at the image edges/corners where distortion is highest.\n\n";
+        } else {
+            ss << "✓  Good FOV coverage! The calibration should be reliable across the FOV.\n\n";
+        }
+    }
+    
+    // Calibration Results
+    ss << "--------------------------------------------------------------------------------\n";
+    ss << "                          CALIBRATION RESULTS\n";
+    ss << "--------------------------------------------------------------------------------\n";
+    ss << "\n";
+    ss << "| Stage                     | RMS Error      | Views Used                |\n";
+    ss << "|---------------------------|----------------|---------------------------|\n";
+    ss << "| Stage-1 (initial)         | " << setw(12) << fixed << setprecision(3) << report.stage1_rms << " px | " << setw(25) << report.stage1_views << " |\n";
+    ss << "| Stage-2 (after outliers)  | " << setw(12) << fixed << setprecision(3) << report.stage2_rms << " px | " << setw(25) << report.stage2_views << " |\n";
+    ss << "\n";
+    
+    // Per-view RMS distribution
+    ss << "Per-View Reprojection Error Distribution:\n";
+    ss << "| Range              | Count      | Percentage  |\n";
+    ss << "|--------------------|------------|-------------|\n";
+    int total_views = report.views_below_1px + report.views_1_5px + report.views_5_10px + report.views_above_10px;
+    if (total_views > 0) {
+        ss << "| < 1 px             | " << setw(10) << report.views_below_1px << " | " << setw(9) << fixed << setprecision(1) << (100.0 * report.views_below_1px / total_views) << "% |\n";
+        ss << "| 1 - 5 px           | " << setw(10) << report.views_1_5px << " | " << setw(9) << fixed << setprecision(1) << (100.0 * report.views_1_5px / total_views) << "% |\n";
+        ss << "| 5 - 10 px          | " << setw(10) << report.views_5_10px << " | " << setw(9) << fixed << setprecision(1) << (100.0 * report.views_5_10px / total_views) << "% |\n";
+        ss << "| > 10 px            | " << setw(10) << report.views_above_10px << " | " << setw(9) << fixed << setprecision(1) << (100.0 * report.views_above_10px / total_views) << "% |\n";
+    }
+    ss << "\n";
+    ss << "Min/Max/Avg view RMS: " << fixed << setprecision(2) << report.min_view_rms << " / " << report.max_view_rms << " / " << report.avg_view_rms << " px\n\n";
+    
+    // Camera Parameters
+    ss << "--------------------------------------------------------------------------------\n";
+    ss << "                          CAMERA PARAMETERS\n";
+    ss << "--------------------------------------------------------------------------------\n";
+    ss << "\n";
+    ss << "Image Size: " << report.image_size.width << " x " << report.image_size.height << " pixels\n";
+    ss << "Model: " << report.model_type << "\n\n";
+    ss << "Intrinsic Matrix K:\n";
+    ss << "  [ " << fixed << setprecision(4) << report.fx << "    0.0000    " << report.cx << " ]\n";
+    ss << "  [   0.0000    " << report.fy << "    " << report.cy << " ]\n";
+    ss << "  [   0.0000      0.0000      1.0000 ]\n";
+    ss << "\n";
+    
+    // Quality Assessment
+    ss << "--------------------------------------------------------------------------------\n";
+    ss << "                          QUALITY ASSESSMENT\n";
+    ss << "--------------------------------------------------------------------------------\n";
+    ss << "\n";
+    
+    string quality;
+    if (report.stage2_rms < 0.5) quality = "EXCELLENT";
+    else if (report.stage2_rms < 1.0) quality = "VERY GOOD";
+    else if (report.stage2_rms < 2.0) quality = "GOOD";
+    else if (report.stage2_rms < 5.0) quality = "ACCEPTABLE";
+    else quality = "POOR - consider recalibrating";
+    
+    ss << "Overall Quality: " << quality << " (RMS = " << fixed << setprecision(3) << report.stage2_rms << " px)\n\n";
+    
+    if (report.stage2_rms > 2.0) {
+        ss << "Recommendations for improvement:\n";
+        ss << "  - Use a larger/flatter checkerboard\n";
+        ss << "  - Ensure better lighting conditions\n";
+        ss << "  - Reduce motion blur in video capture\n";
+        ss << "  - Capture more frames with varied poses\n";
+    }
+    
+    ss << "\n================================================================================\n";
+    ss << "Output files:\n";
+    ss << "  - Calibration: " << cfg.output_file << "\n";
+    ss << "  - Report: " << cfg.report_file << "\n";
+    ss << "  - Undistorted sample: " << cfg.undistorted_image_output << "\n";
+    ss << "================================================================================\n";
+    
+    string reportContent = ss.str();
+    
+    // Print to terminal
+    cout << "\n" << reportContent;
+    
+    // Save to file
+    ofstream reportFile(reportPath);
+    if (reportFile.is_open()) {
+        reportFile << reportContent;
+        reportFile.close();
+        cout << "\nReport saved to: " << reportPath << endl;
+    } else {
+        cerr << "Warning: Could not save report to " << reportPath << endl;
+    }
+}
+
+// ============ End of Report Generation Functions ============
+
 // ============ End of Intelligent Frame Selection Helpers ============
 
 static double computeViewRms(const vector<Point3f>& obj,
@@ -224,6 +485,14 @@ int main(int argc, char** argv) {
         return -1;
     }
 
+    // Initialize calibration report
+    CalibrationReport report;
+    report.timestamp = getCurrentTimestamp();
+    report.smart_selection_enabled = cfg.smart_frame_selection;
+    report.grid_divisions = cfg.grid_divisions;
+    report.min_orientation_diff = cfg.min_orientation_diff;
+    report.model_type = cfg.output_model;
+
     VideoCapture cap(cfg.video_path);
     if (!cap.isOpened()) {
         cerr << "Error opening video file: " << cfg.video_path << endl;
@@ -246,6 +515,7 @@ int main(int argc, char** argv) {
     Size imageSize;
     int validFrames = 0;
     int skippedSimilar = 0;
+    int totalDetections = 0;
 
     // For intelligent frame selection
     vector<FrameInfo> selectedFrames;
@@ -275,6 +545,7 @@ int main(int argc, char** argv) {
                 CALIB_CB_ADAPTIVE_THRESH + CALIB_CB_NORMALIZE_IMAGE + CALIB_CB_FAST_CHECK);
 
             if (found) {
+                totalDetections++;
                 cornerSubPix(gray, corners, Size(11, 11), Size(-1, -1),
                     TermCriteria(TermCriteria::EPS + TermCriteria::COUNT, 30, 0.01));
                 
@@ -341,6 +612,13 @@ int main(int argc, char** argv) {
     }
     cout << endl;
     
+    // Populate report with frame statistics
+    report.total_frames_processed = frameCount;
+    report.total_frames_detected = totalDetections;
+    report.frames_kept = validFrames;
+    report.frames_skipped_similar = skippedSimilar;
+    report.image_size = imageSize;
+    
     // Print FOV coverage statistics if smart selection was used
     if (cfg.smart_frame_selection && !gridCellCounts.empty()) {
         cout << "\n=== FOV Coverage Analysis ===" << endl;
@@ -365,6 +643,14 @@ int main(int argc, char** argv) {
              << " (" << (100.0 * wellCoveredCells / totalCells) << "%)" << endl;
         cout << "Total frames skipped (too similar): " << skippedSimilar << endl;
         cout << "============================\n" << endl;
+        
+        // Populate report with FOV coverage data
+        report.grid_cell_counts = gridCellCounts;
+        report.total_cells = totalCells;
+        report.covered_cells = coveredCells;
+        report.well_covered_cells = wellCoveredCells;
+        report.coverage_percentage = 100.0 * coveredCells / totalCells;
+        report.well_covered_percentage = 100.0 * wellCoveredCells / totalCells;
     }
     
     if (validFrames < 1) {
@@ -387,6 +673,10 @@ int main(int argc, char** argv) {
     cout << "Stage-1 RMS (OpenCV): " << calib1.rms << " pixels" << endl;
     cout << "Stage-1 K:" << endl << calib1.K << endl;
     cout << "Stage-1 D (k1,k2,k3,k4): " << calib1.D.t() << endl;
+    
+    // Populate stage-1 report data
+    report.stage1_rms = calib1.rms;
+    report.stage1_views = validFrames;
 
     vector<double> perViewRms(objectPoints.size(), 0.0);
     for (size_t i = 0; i < objectPoints.size(); ++i) {
@@ -410,6 +700,15 @@ int main(int argc, char** argv) {
     }
     cout << "Distribution: <1px: " << below1 << ", 1-5px: " << below5 
          << ", 5-10px: " << below10 << ", >10px: " << above10 << endl;
+    
+    // Populate report with per-view RMS statistics
+    report.min_view_rms = minRms;
+    report.max_view_rms = maxRms;
+    report.avg_view_rms = avgRms;
+    report.views_below_1px = below1;
+    report.views_1_5px = below5;
+    report.views_5_10px = below10;
+    report.views_above_10px = above10;
 
     // Select inliers
     vector<int> indices(objectPoints.size());
@@ -454,6 +753,14 @@ int main(int argc, char** argv) {
         cout << "Stage-2 K:" << endl << calib2.K << endl;
         cout << "Stage-2 D (k1,k2,k3,k4): " << calib2.D.t() << endl;
     }
+    
+    // Populate report with stage-2 results
+    report.stage2_rms = calib2.rms;
+    report.stage2_views = (!inlierIdx.empty()) ? static_cast<int>(inlierIdx.size()) : report.stage1_views;
+    report.fx = calib2.K.at<double>(0, 0);
+    report.fy = calib2.K.at<double>(1, 1);
+    report.cx = calib2.K.at<double>(0, 2);
+    report.cy = calib2.K.at<double>(1, 2);
 
     const Mat& K = calib2.K;
     const Mat& D = calib2.D;
@@ -847,6 +1154,9 @@ int main(int argc, char** argv) {
         imwrite(cfg.undistorted_image_output, undistorted);
         cout << "Undistorted sample saved to " << cfg.undistorted_image_output << endl;
     }
+
+    // Generate and display calibration report
+    generateReport(report, cfg.report_file, cfg);
 
     return 0;
 }

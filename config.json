@@ -5,6 +5,7 @@
     "square_size": 0.030,
     "output_file": "calibration_results.yaml",
     "undistorted_image_output": "undistorted_sample.jpg",
+    "report_file": "calibration_report.txt",
     "output_model": "OCam",
     "show_detection": false,
     "frame_step": 5,
