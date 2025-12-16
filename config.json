@@ -1,5 +1,5 @@
 {
-    "video_path": "/mnt/e/Zaban_develop_idea/Agent/fisheye_calibration/TV_CAM.mkv",
+    "video_path": "/mnt/e/Zaban_develop_idea/Agent/fisheye_calibration/camera3.mkv",
     "board_width": 11,
     "board_height": 8,
     "square_size": 0.030,
@@ -11,11 +11,15 @@
     "frame_step": 5,
 
     "max_frames": 0,
-    "outlier_reject_threshold_px": 10.0,
-    "outlier_reject_top_fraction": 0.2,
+    "outlier_reject_threshold_px": 5.0,
+    "outlier_reject_top_fraction": 0.3,
+    "undistort_fov_scale": 0.5,
 
     "smart_frame_selection": true,
     "grid_divisions": 5,
-    "min_frames_per_cell": 2,
-    "min_orientation_diff": 15.0
+    "min_frames_per_cell": 1,
+    "min_orientation_diff": 15.0,
+    "max_tilt_threshold": 0.6,
+    "max_rotation_angle": 45.0,
+    "save_selected_frames": true
 }

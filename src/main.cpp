@@ -11,6 +11,8 @@
 #include <numeric>
 #include <algorithm>
 #include <iomanip>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 using json = nlohmann::json;
 using namespace std;
@@ -29,11 +31,15 @@ struct Config {
     int max_frames;
     double outlier_reject_threshold_px;
     double outlier_reject_top_fraction;
+    double undistort_fov_scale;  // FOV scale for undistortion (0.3-0.8, lower=wider)
     // Intelligent frame selection
     bool smart_frame_selection;
     int grid_divisions;        // Divide image into NxN grid for FOV coverage
     int min_frames_per_cell;   // Minimum frames per grid cell
     double min_orientation_diff; // Minimum orientation difference (degrees)
+    double max_tilt_threshold; // Maximum tilt ratio (0.0-1.0, higher = more tilted)
+    double max_rotation_angle; // Maximum absolute rotation angle from horizontal (degrees)
+    bool save_selected_frames; // Save selected frames to folder
     // Report output
     string report_file;
 };
@@ -100,14 +106,50 @@ Config loadConfig(const string& filename) {
     cfg.max_frames = data.value("max_frames", 80);
     cfg.outlier_reject_threshold_px = data.value("outlier_reject_threshold_px", -1.0);
     cfg.outlier_reject_top_fraction = data.value("outlier_reject_top_fraction", 0.2);
+    cfg.undistort_fov_scale = data.value("undistort_fov_scale", 0.5);  // default 0.5 for wide FOV
     // Intelligent frame selection parameters
     cfg.smart_frame_selection = data.value("smart_frame_selection", false);
     cfg.grid_divisions = data.value("grid_divisions", 5);  // 5x5 grid = 25 cells
     cfg.min_frames_per_cell = data.value("min_frames_per_cell", 2);
     cfg.min_orientation_diff = data.value("min_orientation_diff", 15.0);  // degrees
+    cfg.max_tilt_threshold = data.value("max_tilt_threshold", 0.6);  // 0.6 = reject frames with >60% tilt
+    cfg.max_rotation_angle = data.value("max_rotation_angle", 45.0);  // reject boards rotated >45° from horizontal
+    cfg.save_selected_frames = data.value("save_selected_frames", false);
     // Report output file
     cfg.report_file = data.value("report_file", "calibration_report.txt");
     return cfg;
+}
+
+// Helper function to create directory
+static bool createDirectory(const string& path) {
+    struct stat info;
+    if (stat(path.c_str(), &info) != 0) {
+        // Directory doesn't exist, create it
+#ifdef _WIN32
+        return mkdir(path.c_str()) == 0;
+#else
+        return mkdir(path.c_str(), 0755) == 0;
+#endif
+    } else if (info.st_mode & S_IFDIR) {
+        // Directory already exists
+        return true;
+    }
+    return false;
+}
+
+// Extract filename without extension from full path
+static string getVideoBaseName(const string& videoPath) {
+    // Find last directory separator
+    size_t lastSlash = videoPath.find_last_of("/\\");
+    string filename = (lastSlash != string::npos) ? videoPath.substr(lastSlash + 1) : videoPath;
+    
+    // Remove extension
+    size_t lastDot = filename.find_last_of(".");
+    if (lastDot != string::npos) {
+        filename = filename.substr(0, lastDot);
+    }
+    
+    return filename;
 }
 
 // ============ Intelligent Frame Selection Helpers ============
@@ -186,7 +228,26 @@ struct FrameInfo {
 static bool isFrameDiverse(const FrameInfo& newFrame, 
                           const vector<FrameInfo>& existingFrames,
                           double minOrientationDiff,
-                          int gridDivisions) {
+                          int gridDivisions,
+                          double maxTiltThreshold,
+                          double maxRotationAngle) {
+    // First check: reject frames with excessive tilt (extreme perspective distortion)
+    // This prevents poor calibration from highly angled edge/corner frames
+    double maxAbsTilt = max(abs(newFrame.tilt.first), abs(newFrame.tilt.second));
+    double tiltRatio = maxAbsTilt / 45.0;  // Normalize to 0-1 range (45° is reference)
+    if (tiltRatio > maxTiltThreshold) {
+        return false;  // Frame too tilted - would degrade calibration quality
+    }
+    
+    // Second check: reject frames with excessive rotation angle
+    // Normalize orientation to -90 to +90 range (relative to horizontal)
+    double rotation = newFrame.orientation;
+    while (rotation > 90) rotation -= 180;
+    while (rotation < -90) rotation += 180;
+    if (abs(rotation) > maxRotationAngle) {
+        return false;  // Board rotated too much from horizontal - poor corner detection
+    }
+    
     // Count frames in same grid cell
     int sameCellCount = 0;
     for (const auto& f : existingFrames) {
@@ -520,14 +581,32 @@ int main(int argc, char** argv) {
     // For intelligent frame selection
     vector<FrameInfo> selectedFrames;
     vector<int> gridCellCounts;
+    string outputFolder;
+    
     if (cfg.smart_frame_selection) {
         gridCellCounts.resize(cfg.grid_divisions * cfg.grid_divisions, 0);
+        
+        // Create output folder for selected frames if enabled
+        if (cfg.save_selected_frames) {
+            string videoBaseName = getVideoBaseName(cfg.video_path);
+            outputFolder = videoBaseName + "_selected_frames";
+            
+            if (createDirectory(outputFolder)) {
+                cout << "Created output folder: " << outputFolder << endl;
+            } else {
+                cerr << "Warning: Could not create output folder " << outputFolder << endl;
+                cfg.save_selected_frames = false;  // Disable saving
+            }
+        }
     }
 
     cout << "Processing video..." << endl;
     if (cfg.smart_frame_selection) {
         cout << "Smart frame selection ENABLED (grid: " << cfg.grid_divisions << "x" << cfg.grid_divisions 
              << ", min orientation diff: " << cfg.min_orientation_diff << " deg)" << endl;
+        if (cfg.save_selected_frames) {
+            cout << "Saving selected frames to: " << outputFolder << "/" << endl;
+        }
     }
 
     while (true) {
@@ -562,8 +641,8 @@ int main(int argc, char** argv) {
                     fi.tilt = computeBoardTilt(corners, cfg.board_width, cfg.board_height);
                     fi.gridCell = getGridCell(fi.centroid, imageSize, cfg.grid_divisions);
                     
-                    // Check if frame is sufficiently different
-                    acceptFrame = isFrameDiverse(fi, selectedFrames, cfg.min_orientation_diff, cfg.grid_divisions);
+                    // Check if frame is sufficiently different (includes tilt and rotation filtering)
+                    acceptFrame = isFrameDiverse(fi, selectedFrames, cfg.min_orientation_diff, cfg.grid_divisions, cfg.max_tilt_threshold, cfg.max_rotation_angle);
                     
                     if (acceptFrame) {
                         selectedFrames.push_back(fi);
@@ -577,11 +656,23 @@ int main(int argc, char** argv) {
                     imagePoints.push_back(corners);
                     objectPoints.push_back(obj);
                     validFrames++;
+                    
+                    // Save selected frame to output folder
+                    if (cfg.save_selected_frames && !outputFolder.empty()) {
+                        stringstream ss;
+                        ss << outputFolder << "/frame_" << setfill('0') << setw(6) << validFrames 
+                           << "_f" << frameCount << ".jpg";
+                        imwrite(ss.str(), frame);
+                    }
 
                     if (cfg.max_frames > 0 && validFrames >= cfg.max_frames) {
                         cout << "\nReached max_frames=" << cfg.max_frames << ", stopping capture." << endl;
                         break;
                     }
+                }
+                else if (cfg.save_selected_frames && cfg.smart_frame_selection && !acceptFrame) {
+                    // Frame was detected but skipped - optionally could save to separate folder
+                    // Currently just skipping without saving
                 }
                 
                 if (cfg.show_detection) {
@@ -1131,22 +1222,33 @@ int main(int argc, char** argv) {
     fs.release();
     cout << "Calibration saved to " << cfg.output_file << endl;
 
-    // Undistort a sample image
-    // We'll use the last valid frame we captured (or reload the video if needed, but let's just use the last 'frame' variable if it's not empty, 
-    // actually 'frame' is empty at loop exit. Let's reload the video or just keep one valid frame).
-    // Better: capture a frame specifically for undistortion or use the first one.
-    
+    // Undistort a sample image with proper handling for ultra-wide FOV
     cap.open(cfg.video_path);
     Mat sampleFrame;
     if (cap.read(sampleFrame)) {
         Mat undistorted;
         Mat map1, map2;
-        // New camera matrix for undistortion (can be same as K or optimized)
-        Mat newK = K.clone(); 
-        // Balance sets the new focal length. 0.0 to 1.0. 
-        // fisheye::estimateNewCameraMatrixForUndistortRectify is useful here.
-        double balance = 0.5; // Adjust balance between 0.0 (max FOV) and 1.0 (no distortion)
-        fisheye::estimateNewCameraMatrixForUndistortRectify(K, D, imageSize, Mat::eye(3, 3, CV_64F), newK, balance, imageSize, 1.0);
+        
+        // Option 1: Use original K matrix (preserves aspect ratio but may crop)
+        // This is the most reliable for fisheye lenses
+        Mat newK = K.clone();
+        
+        // Option 2: Scale down focal length to fit more of the undistorted image
+        // For ultra-wide FOV (200°), use a scaling factor to reduce distortion stretch
+        double fx = K.at<double>(0, 0);
+        double fy = K.at<double>(1, 1);
+        double cx = K.at<double>(0, 2);
+        double cy = K.at<double>(1, 2);
+        
+        // Scale focal lengths by 0.4-0.6 for 200° FOV to reduce stretching
+        // Lower value = wider FOV but more stretch at edges
+        // Higher value = less stretch but crops more
+        double fov_scale = cfg.undistort_fov_scale;  // Adjust this if needed (0.3-0.8 range)
+        
+        newK.at<double>(0, 0) = fx * fov_scale;  // fx
+        newK.at<double>(1, 1) = fy * fov_scale;  // fy
+        newK.at<double>(0, 2) = cx;              // cx (keep centered)
+        newK.at<double>(1, 2) = cy;              // cy (keep centered)
         
         fisheye::initUndistortRectifyMap(K, D, Mat::eye(3, 3, CV_64F), newK, imageSize, CV_16SC2, map1, map2);
         remap(sampleFrame, undistorted, map1, map2, INTER_LINEAR);
