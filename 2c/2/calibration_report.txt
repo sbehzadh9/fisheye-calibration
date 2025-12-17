@@ -1,0 +1,96 @@
+================================================================================
+                    FISHEYE CAMERA CALIBRATION REPORT
+================================================================================
+Generated: 2025-12-15 10:56:34
+Video: /mnt/e/Zaban_develop_idea/Agent/fisheye_calibration/TV_CAM_2c_2.mkv
+Output Model: OCam
+
+--------------------------------------------------------------------------------
+                         FRAME SELECTION SUMMARY
+--------------------------------------------------------------------------------
+
+| Metric                    | Value                                    |
+|---------------------------|------------------------------------------|
+| Smart Frame Selection     | ENABLED                        |
+| Total frames processed    | 4398                                     |
+| Frames with board detected| 837                                      |
+| Frames after filtering    | 70 kept, 767 skipped                     |
+| Similar frames skipped    | 767                                      |
+
+--------------------------------------------------------------------------------
+                          FOV COVERAGE ANALYSIS
+--------------------------------------------------------------------------------
+
+Grid: 5x5 (25 cells)
+Min orientation difference: 15 degrees
+
+| Metric                    | Value                                    |
+|---------------------------|------------------------------------------|
+| FOV coverage (any frames) | 12/25 (48%)                              |
+| Well-covered cells (>=2)  | 12/25 (48%)                              |
+
+FOV Coverage Grid (frames per cell):
+
+    +-----+-----+-----+-----+-----+
+    |  L  |     |  C  |     |  R  |   (L=Left, C=Center, R=Right)
+    +-----+-----+-----+-----+-----+
+ T  | 0   | 0   | 0   | 0   | 0   |   T=Top
+    +-----+-----+-----+-----+-----+
+    | 0   | 5   | 4   | 3   | 2   |
+    +-----+-----+-----+-----+-----+
+ M  | 1   | 12  | 24  | 9   | 2   |   M=Middle
+    +-----+-----+-----+-----+-----+
+    | 0   | 3   | 4   | 1   | 0   |
+    +-----+-----+-----+-----+-----+
+ B  | 0   | 0   | 0   | 0   | 0   |   B=Bottom
+    +-----+-----+-----+-----+-----+
+
+⚠️  WARNING: Low FOV coverage! For best calibration of wide-angle lenses:
+    - Move the checkerboard to the edges and corners of the image
+    - Include more poses at different distances and tilts
+    - Aim for at least 60% grid coverage
+
+--------------------------------------------------------------------------------
+                          CALIBRATION RESULTS
+--------------------------------------------------------------------------------
+
+| Stage                     | RMS Error      | Views Used                |
+|---------------------------|----------------|---------------------------|
+| Stage-1 (initial)         | 198.245      px | 70                        |
+| Stage-2 (after outliers)  | 1.534        px | 56                        |
+
+Per-View Reprojection Error Distribution:
+| Range              | Count      | Percentage  |
+|--------------------|------------|-------------|
+| < 1 px             | 0          | 0.0      % |
+| 1 - 5 px           | 33         | 47.1     % |
+| 5 - 10 px          | 26         | 37.1     % |
+| > 10 px            | 11         | 15.7     % |
+
+Min/Max/Avg view RMS: 1.55 / 1113.01 / 67.70 px
+
+--------------------------------------------------------------------------------
+                          CAMERA PARAMETERS
+--------------------------------------------------------------------------------
+
+Image Size: 1920 x 1080 pixels
+Model: OCam
+
+Intrinsic Matrix K:
+  [ 582.9254    0.0000    939.8070 ]
+  [   0.0000    583.8993    575.3916 ]
+  [   0.0000      0.0000      1.0000 ]
+
+--------------------------------------------------------------------------------
+                          QUALITY ASSESSMENT
+--------------------------------------------------------------------------------
+
+Overall Quality: GOOD (RMS = 1.534 px)
+
+
+================================================================================
+Output files:
+  - Calibration: calibration_results.yaml
+  - Report: calibration_report.txt
+  - Undistorted sample: undistorted_sample.jpg
+================================================================================

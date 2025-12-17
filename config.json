@@ -1,15 +1,25 @@
 {
-    "video_path": "calibration_video.mp4",
-    "board_width": 9,
-    "board_height": 6,
-    "square_size": 0.025,
+    "video_path": "/mnt/e/Zaban_develop_idea/Agent/fisheye_calibration/camera3.mkv",
+    "board_width": 11,
+    "board_height": 8,
+    "square_size": 0.030,
     "output_file": "calibration_results.yaml",
     "undistorted_image_output": "undistorted_sample.jpg",
-    "output_model": "DS",
-    "show_detection": true,
-    "frame_step": 10,
+    "report_file": "calibration_report.txt",
+    "output_model": "OCam",
+    "show_detection": false,
+    "frame_step": 5,
 
-    "max_frames": 80,
-    "outlier_reject_threshold_px": 10.0,
-    "outlier_reject_top_fraction": 0.2
+    "max_frames": 0,
+    "outlier_reject_threshold_px": 5.0,
+    "outlier_reject_top_fraction": 0.3,
+    "undistort_fov_scale": 0.5,
+
+    "smart_frame_selection": true,
+    "grid_divisions": 5,
+    "min_frames_per_cell": 1,
+    "min_orientation_diff": 15.0,
+    "max_tilt_threshold": 0.6,
+    "max_rotation_angle": 45.0,
+    "save_selected_frames": true
 }
